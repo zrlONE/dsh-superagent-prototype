@@ -16,14 +16,42 @@ The bundle defines `dsh-superagent-worker` for Executors and `dsh-superagent-rou
 
 Opening a blank managed Session in the Web UI can select the profile's default preset. dsh-superagent restores its role-specific preset before the first turn.
 
-Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
+Both presets run as the operator's OS user and read messages from subscribed Threads. Their sandbox comes from Execution settings, not the preset: a worker Session starts with `workspace-write`, confined to its Ticket directory, and the main Session with `read-only`; `danger-full-access` must be chosen explicitly. Approvals are `never`, so an escalation past the sandbox is refused. A CLI executor applies the same setting where the CLI supports it: Codex uses its own sandbox, Claude Code keeps its file tools in the Ticket directory, and Command Code can write only with `danger-full-access`. Account wrappers choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
+
+### Workflow
+
+Workflow is off by default. Enable it in **Settings → Execution → Workflow** to start an independent reviewer for each `ready` Ticket with a pull request, send requested changes back to the writer, cap review and CI-fix rounds, and stop an assignment with no activity past the watchdog timeout. The reviewer runs in the Ticket directory with a read-only sandbox; a Ticket that exceeds its rounds or the timeout is handed to a person as `failed`. Choose a reviewer model, or leave it empty to use the project's worker model and then the Executor model.
+
+### Alerts and token budgets
+
+Enable **Settings → Execution → Alerts and budget** to post a notice into a Ticket's source conversation when its worker reports `failed`/`blocked`, asks a person a question, has an Input delivery failure, or exceeds a token budget. The message goes to the same GitHub issue/PR or Feishu thread as ordinary replies; each event is posted once.
+
+Both budgets are in reported tokens and `0` means unlimited. `Ticket tokens` counts the Ticket's worker and reviewer Sessions, reports the Ticket failed and stops its assignment when reached. `Daily tokens` counts every Session for the calendar day; when reached, processing pauses and the most recently updated open Ticket receives an alert. Raise the budget or wait for the next day to resume. Token usage is recorded per Session and survives restarts; a CLI executor's own reported usage is included.
+
+### Dashboard
+
+The standalone board runs separately from the Harness Web UI:
+
+```sh
+node scripts/dsh-superagent-dashboard.mjs
+```
+
+It serves `http://127.0.0.1:3083/` and proxies the management API. It can pause/resume processing and retry/stop Tickets;
+other settings remain in the application panel. Set `DASHBOARD_HOST=0.0.0.0` with `DASHBOARD_TOKEN`
+to read it from a phone on the same network, and `DASHBOARD_PRICES` for estimated costs. `docs/009-dashboard.md` covers the
+data, controls, prices and limits.
+
+### Projects
+
+Execution settings can hold several projects, each with its own GitHub repository, worktree root, prepare command, worker model and rules. Setup still configures one repository. After setup, add projects in **Settings → Execution → Projects**; the active project's repository is written to the GitHub Source, so saving a switch rechecks that the agent account can push there and restarts dsh-superagent. Existing Tickets keep the project directory, model and rules fixed at accept time. Only the active project's repository receives new notifications and repository-wide streams in this version; polling every project at once is the next step.
 
 ## Prerequisites
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
-- A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
+- One or more repositories on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone. With the default `workspace-write` sandbox, the prepare command should create a self-contained clone (`git clone --shared <clone> "$DSH_SUPERAGENT_DIR"`) so the Ticket's `.git` is inside the writable directory; a linked `git worktree` keeps its metadata outside it and works only with `danger-full-access`. Install `git-lfs` if a repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
+- For a CLI executor: the `claude`, `codex`, or `cmd` CLI installed and signed in for the OS user that runs dsh-superagent. Command Code's print mode writes files only with `danger-full-access`; choose Codex or the harness for a confined worker.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
 ## Accounts

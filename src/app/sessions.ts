@@ -7,7 +7,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
-import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
+import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
@@ -19,6 +19,8 @@ import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+import type { UsageMeter } from './usage.ts'
+import type { RoleModel, Settings } from '../policy.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -31,11 +33,13 @@ export interface SessionsHost {
   readonly health: HealthEntry
   readonly masterId: string
   readonly lifetime: AbortSignal
+  /** Token usage accounting for the dashboard, fed by every Session event. */
+  readonly usage?: Pick<UsageMeter, 'observe' | 'seed'>
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
-  /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
-  tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Tools to register on the main Session (`ticket === undefined`), on `ticket`'s worker Session, or on its reviewer Session. */
+  tools(agent: Agent, ticket?: Ticket, role?: 'worker' | 'reviewer'): Tool[]
 }
 
 /**
@@ -46,10 +50,21 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+/** Returns the reviewer Session ID (`reviewer-<ticketId>`) for a ticket. */
+export const reviewerSessionId = (ticketId: string): string => `reviewer-${ticketId}`
+/** Returns the ticket ID for a reviewer Session ID (`reviewer-<ticketId>`), or undefined for other sessions. */
+export const ticketOfReviewerSession = (sessionId: string): string | undefined =>
+  sessionId.startsWith('reviewer-') ? sessionId.slice('reviewer-'.length) : undefined
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
     'agent-preset/selected'(sessionId: string, agentPreset: string): void
+  }
+}
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /** The session's sandbox-mode override: the log-only event `setSandboxMode` in `@deepseek-ai/dsh-sandbox-policy` appends. */
+    'sandbox/mode': { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; source?: 'delegation' }
   }
 }
 /**
@@ -60,6 +75,14 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/**
+ * The sandbox a Session runs under: the router's `routerPermission` (default `read-only`) and a worker's `permission`
+ * (default `workspace-write`, confined to its ticket directory). `danger-full-access` is chosen explicitly.
+ */
+export function sessionPermission(settings: Pick<Settings, 'executor'>, role: 'orchestrator' | 'worker' | 'reviewer'):
+  Settings['executor']['permission'] | 'read-only' {
+  return role === 'orchestrator' ? settings.executor.routerPermission : role === 'reviewer' ? 'read-only' : settings.executor.permission
+}
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -112,6 +135,8 @@ export class Sessions {
       this.retryHealth.clear(agent.id); this.updateModelHealth()
     })
     ctx.on('session/event', (session, event) => {
+      // Usage belongs to every managed Session, including subagents and reviewers; the binding checks below are for prompts.
+      this.host.usage?.observe(session.id, event)
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
@@ -123,7 +148,7 @@ export class Sessions {
     // its first turn DSH refuses any selection, which leaves it as it is.
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
-        const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
+        const ticketId = ticketOfSession(sessionId) ?? ticketOfReviewerSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
         const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
@@ -134,22 +159,49 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  /** Backfills token usage from this profile's persisted managed Sessions once at startup; unreadable Sessions contribute nothing. */
+  async seedUsage(): Promise<void> {
+    if (!this.host.usage) return
+    const targets = new Set([this.host.masterId, ...this.host.store.tickets.list().flatMap(ticket => [workerSessionId(ticket.id), reviewerSessionId(ticket.id)])])
+    let snapshots: Awaited<ReturnType<Context['sessionPersistence']['list']>>
+    try { snapshots = await this.ctx.sessionPersistence.list() } catch { return }
+    for (const snapshot of snapshots) {
+      const id = snapshot.header.id
+      if (!targets.has(id)) continue
+      try {
+        const handle = await this.ctx.sessionPersistence.open(id, 'read')
+        for (let offset = 0;;) {
+          const page = await handle.read(offset, 1000)
+          if (!page.events.length) break
+          this.host.usage.seed(id, page.events)
+          offset += page.events.length
+          if (page.events.length < 1000) break
+        }
+        await handle.close()
+      } catch { /* A missing or unreadable Session contributes no usage. */ }
+    }
+  }
+  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model (or `model` for a worker/reviewer), decorates it with prompts/skills/tools, sets its configured sandbox with escalations refused, and renames it to `title`. */
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker' | 'reviewer', model?: RoleModel | null): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
-        agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+        agentPreset: role === 'orchestrator' ? ROUTER_PRESET : WORKER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    const selected = role === 'orchestrator' ? settings.eval.model : model === undefined ? settings.executor.model : model
+    await initializeRoleModel(ctx, result.agent, selected)
     await this.decorate(result.agent)
-    ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
+    // Sessions run unattended: the configured sandbox, and an escalation past it is refused rather than asked of nobody.
+    // Write the sandbox override directly, as `setSandboxMode` does, so the preset table stays untouched.
+    result.agent.session.append('sandbox/mode', { mode: sessionPermission(settings, role) })
+    const approval = ctx.get('approval')
+    if ((approval?.overrideOf(result.agent.session) ?? approval?.config.policy) !== 'never') approval?.setPolicy(result.agent, 'never')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }
@@ -193,6 +245,8 @@ export class Sessions {
     })
     return { revision: prompts.current().revision, sessions, notificationPending: effects.pending('notice', 'prompts') }
   }
+  /** Returns the live DSH status of a managed Session, or undefined when it is not loaded in this process. */
+  agentStatus(sessionId: string): string | undefined { return this.ctx.agents.get(sessionId as SessionId)?.status }
   /** Returns the prompt version a Session runs under (the one bound on its latest model request, or the current version). */
   promptVersion(sessionId: string): PromptVersion {
     const revision = this.host.store.get(KV.sessions.prompts(sessionId))?.at(-1)
@@ -234,18 +288,25 @@ export class Sessions {
     const host = this.host
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
-    if (!master && !ticket) { this.limitSubagent(agent); return }
+    const reviewerTicketId = !master && !ticket ? ticketOfReviewerSession(agent.id) : undefined
+    const reviewTicket = reviewerTicketId ? host.store.tickets.get(reviewerTicketId) : undefined
+    if (!master && !ticket && !reviewTicket) { this.limitSubagent(agent); return }
+    const currentTicket = ticket ?? reviewTicket
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+    // Backfill token usage from a Session loaded from persistence; live events continue from its last sequence.
+    this.host.usage?.seed(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
     this.updateModelHealth()
     // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
     binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
       const version = this.promptFor(agent, context.signal !== undefined)
-      const current = ticket && host.store.tickets.get(ticket.id)
-      const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      const current = currentTicket && host.store.tickets.get(currentTicket.id)
+      const composed = reviewTicket
+        ? `You are the reviewer for ticket ${reviewTicket.id}: ${reviewTicket.title}. Do not modify files. Inspect the checkout and the pull request, run the tests, and end by calling workflow_review with your verdict.`
+        : host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
+      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${!reviewTicket && current ? mandateInstructions(current.mandate) : ''}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
@@ -258,13 +319,13 @@ export class Sessions {
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
+    for (const tool of host.tools(agent, currentTicket, reviewTicket ? 'reviewer' : undefined)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
-      // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
-      binding.disposers.push(...this.workOnly(agent, ticket!.id))
+      // An Executor or reviewer Session keeps the profile's work tools it has; its own tools are not masked.
+      binding.disposers.push(...this.workOnly(agent, currentTicket!.id))
     }
   }
   /**

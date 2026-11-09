@@ -18,6 +18,44 @@ export function family<V, A extends unknown[] = [string]>(prefix: string, format
   return Object.assign((...name: A) => `${prefix}${format(...name)}` as Key<V>, { prefix })
 }
 
+/** Token usage accumulated for one session, with a per-day split for the dashboard. */
+export interface UsageTotals { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; calls: number }
+export interface UsageRecord extends UsageTotals {
+  provider?: string
+  model?: string
+  byDay: Record<string, UsageTotals>
+  /** The last session event sequence counted, so a replayed event is not counted twice. */
+  lastSeq?: number
+  updatedAt: string
+}
+/**
+ * A ticket's workflow progress: review and CI-fix rounds used, the last report that was reviewed, the latest reviewer
+ * verdict, and when the watchdog last acted.
+ */
+export interface WorkflowState {
+  reviewRound: number
+  ciRound: number
+  status: 'idle' | 'reviewing' | 'changes' | 'approved' | 'failed'
+  /** The latest report's `at` that a review covered, so a new ready report starts a new round. */
+  lastReviewedAt?: string
+  reviewerSessionId?: string
+  review?: { verdict: 'approve' | 'changes'; summary: string; issues: string[]; at: string; round: number }
+  watchdogAt?: string
+}
+/** Which alert has already gone out for a Ticket, so a repeated pass does not post the same message again. */
+export interface AlertState {
+  attention?: string
+  report?: string
+  delivery?: string
+  budget?: string
+}
+/** The daily budget alert and pause, recorded once per calendar day and limit. */
+export interface DailyAlertState {
+  day: string
+  limit: number
+  tokens: number
+  paused?: boolean
+}
 export const KV = {
   /** Store: current database schema version. */
   store: { schema: record<number>('schema') },
@@ -55,4 +93,10 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /** Workflow: per-ticket review and CI-fix rounds, the latest verdict, and watchdog state. */
+  workflow: { state: family<WorkflowState, [ticketId: string]>('workflow:') },
+  /** Guardrails: which alert already went out per Ticket, and the day's budget pause. */
+  alerts: { ticket: family<AlertState, [ticketId: string]>('alert:'), daily: record<DailyAlertState>('alert-daily') },
+  /** Token usage by Session, persisted across restarts for the dashboard. */
+  usage: { session: family<UsageRecord, [sessionId: string]>('usage-session:') },
 }

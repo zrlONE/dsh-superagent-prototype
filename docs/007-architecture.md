@@ -198,9 +198,19 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 
 `DshExecutor` (`src/executor/dsh.ts`) provides one Session and directory per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
 
+With `executor.kind` naming a CLI, `launch` prepares the same directory and runs that CLI instead of creating a Session. `deliver` resumes the CLI with the waiting Inputs, `stop` aborts it, and `handOffCli` commits, pushes and binds the pull request before the ready report; the adapter is `src/executor/cli.ts`.
+
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
 
+### Workflow
+
+`Workflow` (`src/app/workflow.ts`) runs after every pass. For a Ticket whose latest Report is `ready` and that follows an open pull request, it starts one reviewer Session (`reviewer-<ticket id>`) in the Ticket directory and prompts it to inspect the change and call `workflow_review`. A `changes` verdict becomes a note Input to the writer, waking it for another turn; `approve` is relayed to the main Session. Review rounds and CI-failure fix rounds stop at `workflow.maxRounds`, after which the Ticket is reported failed and its assignment stopped. The watchdog does the same for a running assignment whose last activity is older than `workflow.timeoutMinutes`. Reviewer Sessions use the worker preset with a `read-only` sandbox and their own tool set (`orchestrator_read` and `workflow_review`); the reviewer policy is off by default.
+
 `WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load.
+
+### Guardrails
+
+`Guardrails` (`src/app/guardrails.ts`) runs after every pass beside the Workflow. With `guardrails.alerts.enabled`, it posts one notice into each of a Ticket's source conversations when the latest Report is `failed` or `blocked`, when an Input could not reach the worker, when the worker asks a person a question, or when a token budget is exceeded. Alert state is stored per Ticket in `KV.alerts.ticket`, so a repeated pass does not post the same alert; a new question or report starts a new alert. `guardrails.budget.ticketTokens` counts the Ticket's worker and reviewer Session tokens, reports it failed and stops its assignment. `guardrails.budget.dailyTokens` counts every Session's tokens for the day, pauses processing, and alerts through the most recently updated open Ticket. Both budgets are 0 (off) by default, and alerts are off until enabled on the Execution settings page.
 
 Transient provider and network failures get three retries. Launches use effect backoff; failed turns receive continuation messages after 15, 30 and 60 seconds. `inputMessage` renders each Input from current Ticket state, and `mandateInstructions` adds the matched-rule limits for inferred work.
 
@@ -218,7 +228,7 @@ Its `context`, `read` and `decide` methods serve `orchestrator_eval`, `orchestra
 
 `Settings` (`src/app/settings.ts`) reads and writes revisioned settings blocks. `current` and `view` read them; `save(block, value, revision, origin)` validates a save; `pause(paused, origin)` changes the separate `paused` setting.
 
-Every save declares its origin: `panel`, `tool` or `sync`. Only `panel` can change the execution environment or fields listed in `SETUP_FIELDS` (`src/deployment.ts`).
+Every save declares its origin: `panel`, `tool`, `sync` or `system`. Only `panel` can change the execution environment or fields listed in `SETUP_FIELDS` (`src/deployment.ts`); `system` is used by the daily budget guardrail to pause processing.
 
 A Policy-version change calculates `policyEffects`, records which Tickets were notified, and calls `Engine.policyChanged`. `syncable` and `sync(id)` refresh a Source's Policy part. `refreshLabels(id)` refreshes display names.
 
@@ -325,6 +335,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
+| `src/app/usage.ts` | `UsageMeter`: token usage per Session and day from `assistant/message` events, and the snapshot the dashboard reads |
+| `src/app/views/dashboard.ts` | The standalone dashboard's data: projects, Tickets, agent Sessions, workflow state and usage |
+| `src/app/workflow.ts` | The `Workflow`: a ready Ticket's reviewer Session, review and CI-fix round limits, and the watchdog for a stuck assignment |
+| `src/app/guardrails.ts` | The `Guardrails`: proactive failure/attention alerts and daily/Ticket token budgets |
+| `src/app/tools/reviewer.ts` | A reviewer Session's tools: `orchestrator_read` and `workflow_review`, which records the verdict |
 | `src/app/settings-history.ts` | `policyHistory`: each saved settings revision with what it changed from the one before |
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
@@ -351,7 +366,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
-| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions`; CLI runs (`runCli`) and their commit, push and pull-request hand-off |
+| `src/executor/cli.ts` | The CLI agent adapter: `cliArgv` and `cliPrompt` for Claude Code, Codex and Command Code, `parseCliOutput` for their JSON streams, and `pullTitle` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -426,6 +442,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
+| `tests/cli-executor.spec.ts` | The CLI agent adapter: argv and prompt for each CLI, parsing their JSON streams, turn caps and failures, and the Command Code full-access rule |
+| `tests/workflow.spec.ts` | The Workflow's review/CI round and watchdog decisions, and the reviewer verdict tool |
+| `tests/guardrails.spec.ts` | Proactive attention/failure alerts and the daily/Ticket token budgets |
+| `tests/usage.spec.ts`, `tests/dashboard.spec.ts`, `tests/dashboard-client.spec.ts` | Token usage accumulation and replay deduplication; the dashboard view's project, Ticket, agent and usage joins; the standalone board's rendering |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |

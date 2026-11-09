@@ -238,7 +238,9 @@ export class Evals extends EnginePart {
     const evaluation = thread.evaluating!
     const triggers = evaluation.triggerIds.flatMap(id => { const trigger = this.repo.triggers.get(id); return trigger ? [trigger] : [] })
     const { id: evalId, strength, policyVersion } = evaluation
-    return { evalId, thread, triggers, strength, policyVersion, tickets: this.ticketsOnThread(thread) }
+    const primary = this.repo.triggers.get(evaluation.primary ?? evaluation.triggerIds[0] ?? '')
+    const projectId = primary ? this.options.projectId?.(primary) : undefined
+    return { evalId, thread, triggers, strength, policyVersion, ...projectId ? { projectId } : {}, tickets: this.ticketsOnThread(thread) }
   }
   /**
    * Record that the queued Triggers `ids` of a Thread start no Eval, for `reason`, and take them out of its queue. Its id

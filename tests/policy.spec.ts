@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SettingsSchema, assessmentOutcome, policyEffects, settingsPolicy, policyVersion, allowedSender, anyoneAllowed, type Settings } from '../src/policy.ts'
+import { SettingsSchema, activeProjectOf, assessmentOutcome, projectFor, projectsOf, policyEffects, rulesForProject, settingsPolicy, policyVersion, allowedSender, anyoneAllowed, type Settings } from '../src/policy.ts'
 import type { MandateBasis } from '../src/core/index.ts'
 import { migrateSettings } from '../src/app/migration.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
@@ -254,7 +254,11 @@ describe('settings migration', () => {
       sources: { feishu: feishuSource({ chats: [{ chatId: CHAT, listen: 'mentions' }, { chatId: OBSERVED, listen: 'all' }], directMessages: false }), github: { enabled: true, config: { pollSeconds: 120 } } },
       policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
       eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
-      executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
+      executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [],
+        permission: 'workspace-write', routerPermission: 'read-only', kind: 'harness', cli: { timeoutMinutes: 30, maxTurns: 60 } },
+      workflow: { enabled: false, reviewerModel: null, maxRounds: 3, watchdog: true, timeoutMinutes: 60 },
+      guardrails: { alerts: { enabled: false, failures: true, attention: true, budget: true }, budget: { dailyTokens: 0, ticketTokens: 0 } },
+      projects: [], activeProject: null,
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })
@@ -291,7 +295,7 @@ describe('assessment outcomes', () => {
     expect(assessmentOutcome(accept(settings('observe')), settings('observe'), 'inferred'))
       .toMatchObject({ kind: 'ignore', reason: { code: 'observed', values: { text: 'asked' } }, audit: { would_accept: true } })
     expect(assessmentOutcome(accept(auto, false), auto, 'inferred')).toMatchObject({ kind: 'ignore', reason: { code: 'noRuleMatched' } })
-    expect(() => assessmentOutcome({ ...accept(auto), rule_assessments: [] }, auto, 'inferred')).toThrow('Exactly one assessment for every enabled rule')
+    expect(() => assessmentOutcome({ ...accept(auto), rule_assessments: [] }, auto, 'inferred')).toThrow('Exactly one assessment for every rule')
     expect(() => assessmentOutcome({ ...accept(auto), intent_evidence: null }, auto, 'inferred')).toThrow('Acceptance requires intent_evidence')
     const scope = { scope: () => ({ listened: true as const, observed: true }) }
     const enabled = auto.policy.rules.find(rule => rule.enabled)!.id
@@ -338,7 +342,7 @@ describe('rule judgements', () => {
     const direction = { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: 'asked' }
     const assessment = { decision: 'accept' as const, direction, title: 'Fix', scope: 'small', reason: 'asked', intent_evidence: 'quote',
       rule_assessments: [{ rule_id: 'copy', matched: true, reason: 'typo' }, { rule_id: 'copy', matched: false, reason: 'again' }] }
-    expect(() => assessmentOutcome(assessment, parsed, 'inferred')).toThrow('Exactly one assessment for every enabled rule')
+    expect(() => assessmentOutcome(assessment, parsed, 'inferred')).toThrow('Exactly one assessment for every rule')
     const once = { ...assessment, rule_assessments: [assessment.rule_assessments[0]!, { rule_id: 'visual', matched: false, reason: 'no colors' }] }
     expect(assessmentOutcome(once, parsed, 'inferred')).toMatchObject({ kind: 'accept', rules: ['copy'] })
   })
@@ -482,5 +486,51 @@ describe('bots and events without a sender', () => {
       ['pulls', { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }],
       ['comments', { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }],
       ['ci', { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false }]])
+  })
+})
+
+describe('projects', () => {
+  const projects = SettingsSchema.parse({
+    sources: { github: { enabled: true, config: { repository: 'acme/alpha', cli: 'gh' } } },
+    projects: [
+      { id: 'alpha', name: 'Alpha', repository: 'acme/alpha', directory: '/srv/alpha', prepare: 'make alpha', rules: ['copy'] },
+      { id: 'beta', name: 'Beta', repository: 'acme/beta' },
+    ],
+    activeProject: 'alpha',
+  })
+  it('resolves projects by repository, with the active project as the fallback and a synthetic default without projects', () => {
+    expect(projectsOf(projects).map(project => project.id)).toEqual(['alpha', 'beta'])
+    expect(activeProjectOf(projects).id).toBe('alpha')
+    expect(projectFor(projects, 'acme/beta').id).toBe('beta')
+    expect(projectFor(projects, 'acme/unknown').id).toBe('alpha')
+    // The repository comparison is case-insensitive, as GitHub logins and repositories are.
+    expect(projectFor(projects, 'ACME/Beta').id).toBe('beta')
+    const legacy = SettingsSchema.parse({ sources: { github: { enabled: true, config: { repository: 'acme/one', cli: 'gh' } } },
+      executor: { ...SettingsSchema.parse({}).executor, directory: '/srv/legacy', prepare: 'make', model: { provider: 'p', model: 'm' } } })
+    expect(projectsOf(legacy)).toEqual([{ id: 'default', name: 'acme/one', repository: 'acme/one', directory: '/srv/legacy',
+      prepare: 'make', model: { provider: 'p', model: 'm' }, rules: null, enabled: true }])
+    expect(activeProjectOf(legacy).id).toBe('default')
+  })
+  it('narrows the assessed rules to a project\'s selection, and treats an empty selection as every enabled rule', () => {
+    expect(rulesForProject(projects, 'alpha').map(rule => rule.id)).toEqual(['copy'])
+    expect(rulesForProject(projects, 'beta').map(rule => rule.id)).toEqual(['copy', 'visual'])
+    expect(rulesForProject(projects, null).map(rule => rule.id)).toEqual(['copy', 'visual'])
+    const assessment = { decision: 'ignore' as const, direction: { implementation_requested: false, target_basis: 'undetermined' as const,
+      requires_design_decision: true, evidence: 'x' }, title: 'T', scope: 'S', reason: 'R',
+      rule_assessments: [{ rule_id: 'copy', matched: true, reason: 'judged' }] }
+    expect(() => assessmentOutcome(assessment, projects, 'inferred')).toThrow('Exactly one assessment for every rule')
+    expect(assessmentOutcome(assessment, projects, 'inferred', rulesForProject(projects, 'alpha'))).toMatchObject({ kind: 'ignore' })
+  })
+  it('changes the Policy version when a project\'s repository, rules or enabled state changes', () => {
+    const version = policyVersion(projects)
+    expect(policyVersion({ ...projects, activeProject: 'beta' })).not.toBe(version)
+    expect(policyVersion({ ...projects, projects: projects.projects.map(project => project.id === 'beta' ? { ...project, enabled: false } : project) })).not.toBe(version)
+    expect(policyVersion({ ...projects, projects: projects.projects.map(project => project.id === 'alpha' ? { ...project, rules: null } : project) })).not.toBe(version)
+    expect(policyVersion({ ...projects, projects: projects.projects.map(project => project.id === 'alpha' ? { ...project, directory: '/elsewhere' } : project) })).toBe(version)
+  })
+  it('refuses duplicate project IDs and a repository that is not owner/name', () => {
+    expect(() => SettingsSchema.parse({ projects: [{ id: 'a', name: 'A', repository: 'acme/a' }, { id: 'a', name: 'B', repository: 'acme/b' }] }))
+      .toThrow('Duplicate project IDs')
+    expect(() => SettingsSchema.parse({ projects: [{ id: 'a', name: 'A', repository: 'not-a-repository' }] })).toThrow('owner/name')
   })
 })

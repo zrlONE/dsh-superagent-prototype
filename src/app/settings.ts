@@ -2,8 +2,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
-import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
-import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
+import { EvalConfigSchema, ExecutorConfigSchema, GuardrailsConfigSchema, PolicyConfigSchema, ProjectsValueSchema, SettingsSchema, WorkflowConfigSchema, activeProjectOf, policyEffects, policyVersion } from '../policy.ts'
+import type { ProjectsValue, Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
@@ -22,6 +22,8 @@ export class SettingsConflict extends Error {}
 const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.prepare, executor.blockedCommands])
+/** Project fields that choose a repository, worktree root or prepare command, which only the panel may change. */
+const projectEnvironment = ({ projects }: Pick<SettingsValue, 'projects'>) => JSON.stringify(projects.map(project => [project.repository, project.directory, project.prepare]))
 
 /** Schema parser, settings merger, and non-panel origin guard for one settings block kind. */
 interface Block {
@@ -29,7 +31,7 @@ interface Block {
   merge(settings: SettingsValue, value: unknown, id: string): SettingsValue
   guard?(current: SettingsValue, candidate: SettingsValue, origin: SettingsOrigin): void
 }
-const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
+const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'workflow' | 'guardrails' | 'projects' | 'source', Block> = {
   policy: {
     parse: (value, sources) => {
       const policy = PolicyConfigSchema.parse(value)
@@ -43,6 +45,30 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
     // Only the management panel may modify shell execution paths or commands.
     guard: (current, candidate, origin) => { if (origin !== 'panel' && environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment') },
+  },
+  workflow: {
+    parse: value => WorkflowConfigSchema.parse(value),
+    merge: (settings, value) => ({ ...settings, workflow: value as SettingsValue['workflow'] }),
+  },
+  guardrails: {
+    parse: value => GuardrailsConfigSchema.parse(value),
+    merge: (settings, value) => ({ ...settings, guardrails: value as SettingsValue['guardrails'] }),
+  },
+  projects: {
+    parse: value => ProjectsValueSchema.parse(value),
+    // The active project's repository becomes the GitHub Source's repository, so notifications, setup checks and the
+    // worker environment all address the project the operator selected.
+    merge: (settings, value) => {
+      const { projects, activeProject } = value as ProjectsValue
+      const next = { ...settings, projects, activeProject }
+      const active = activeProjectOf(next)
+      const github = settings.sources.github
+      const current = github && typeof github.config.repository === 'string' ? github.config.repository : ''
+      if (!github || !active.repository || current === active.repository) return next
+      return { ...next, sources: { ...settings.sources, github: { ...github, config: { ...github.config, repository: active.repository } } } }
+    },
+    // The repository, worktree root and prepare command decide where code runs; only the management panel may set them.
+    guard: (current, candidate, origin) => { if (origin !== 'panel' && projectEnvironment(current) !== projectEnvironment(candidate)) throw new UserError('panelOnlyEnvironment') },
   },
   source: {
     parse: (value, sources, id) => sources.validate(id, z.object({ enabled: z.boolean(), config: z.unknown() }).parse(value)),
@@ -106,8 +132,8 @@ export class Settings {
   /** Returns the current validated settings from `Store`. */
   current(): SettingsValue { return this.host.store.settings() }
   /**
-   * Returns an overview of all settings blocks with their current block revisions: full values for `pause`, `eval`, and
-   * `executor`; rule summaries and allowed-sender counts for `policy`; and instance status switches for `sources` (with `read: 'settings/<block>'` paths for full block reads).
+   * Returns an overview of all settings blocks with their current block revisions: full values for `pause`, `eval`,
+   * `executor` and `projects`; rule summaries and allowed-sender counts for `policy`; and instance status switches for `sources` (with `read: 'settings/<block>'` paths for full block reads).
    */
   view() {
     const { store, sources } = this.host
@@ -117,6 +143,9 @@ export class Settings {
       pause: { revision: revision('pause'), value: { paused: settings.paused } },
       eval: { revision: revision('eval'), value: settings.eval },
       executor: { revision: revision('executor'), value: settings.executor },
+      workflow: { revision: revision('workflow'), value: settings.workflow },
+      guardrails: { revision: revision('guardrails'), value: settings.guardrails },
+      projects: { revision: revision('projects'), value: { projects: settings.projects, activeProject: settings.activeProject } },
       policy: { revision: revision('policy'), rules: rules.map(rule => ({ id: rule.id, name: rule.name, enabled: rule.enabled })),
         allowed: Object.fromEntries(Object.entries(parts).map(([id, part]) => [id, part.allowed.length])), read: 'settings/policy' },
       sources: sources.instances(settings).map(({ id, kind, enabled, installed }) =>
@@ -131,8 +160,9 @@ export class Settings {
     const { store, sources } = this.host
     const settings = store.settings(), id = block.startsWith('source:') ? block.slice('source:'.length) : undefined
     const instance = id === undefined ? undefined : sources.instances(settings).find(item => item.id === id)
-    const value = block === 'pause' ? { paused: settings.paused } : block === 'policy' || block === 'eval' || block === 'executor' ? settings[block]
-      : instance ? { enabled: instance.enabled, config: instance.config } : undefined
+    const value = block === 'pause' ? { paused: settings.paused } : block === 'projects' ? { projects: settings.projects, activeProject: settings.activeProject }
+      : block === 'policy' || block === 'eval' || block === 'executor' || block === 'workflow' || block === 'guardrails' ? settings[block]
+        : instance ? { enabled: instance.enabled, config: instance.config } : undefined
     if (value === undefined) throw new UserError('unknownBlock', { block })
     return { block, revision: store.blockRevision(block as SettingsSave), value }
   }
@@ -157,10 +187,16 @@ export class Settings {
     const parsed = rules.parse(value, sources, id)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
-    const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
-    const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
+    const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : block === 'workflow' ? candidate.workflow.reviewerModel : null
+    const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : block === 'workflow' ? current.workflow.reviewerModel : null
     if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
       try { await resolveRoleModel(this.host.context, model) }
+      catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
+    }
+    // Each project may name its own worker model; refuse a save that names one the live providers cannot resolve.
+    if (block === 'projects') for (const project of candidate.projects) {
+      if (!project.model) continue
+      try { await resolveRoleModel(this.host.context, project.model) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)

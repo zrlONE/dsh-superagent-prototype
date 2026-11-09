@@ -37,12 +37,13 @@ export interface Assessment {
  * inferred candidate only in `auto` mode (otherwise recording it as `would_accept`).
  * @throws when `rule_assessments` does not cover every enabled rule exactly once, or an accept omits `intent_evidence`.
  */
-export function assessmentOutcome(assessment: Assessment, settings: Pick<Settings, 'policy' | 'eval'>, strength: Strength): AssessmentOutcome {
-  const enabled = settings.policy.rules.filter(rule => rule.enabled)
+export function assessmentOutcome(assessment: Assessment, settings: Pick<Settings, 'policy' | 'eval'>, strength: Strength,
+  rules = settings.policy.rules.filter(rule => rule.enabled)): AssessmentOutcome {
+  const enabled = rules
   const judged = assessment.rule_assessments
   const ids = new Set(judged.map(item => item.rule_id))
   if (judged.length !== enabled.length || ids.size !== judged.length || enabled.some(rule => !ids.has(rule.id))) {
-    throw new Error('Exactly one assessment for every enabled rule is required; disabled, unknown or missing rule IDs are not allowed')
+    throw new Error('Exactly one assessment for every rule in the candidate\'s rules is required; disabled, unknown or missing rule IDs are not allowed')
   }
   const matches = judged.filter(item => item.matched).map(({ rule_id, reason }) => ({ rule_id, reason }))
   const evidence = assessment.intent_evidence ? { intent_evidence: assessment.intent_evidence } : {}
@@ -70,6 +71,31 @@ export type Rule = z.infer<typeof RuleSchema>
 export const RoleModelSchema = z.object({ provider: z.string().trim().min(1), model: z.string().trim().min(1), reasoningEffort: z.string().trim().min(1).optional() }).strict()
 export type RoleModel = z.infer<typeof RoleModelSchema>
 
+/** A project: one repository, its own worktree root and prepare command, worker model, and the rules its work is assessed under. */
+export const ProjectIdSchema = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, '1–32 lowercase letters, digits or dashes, starting with a letter')
+export const ProjectSchema = z.object({
+  id: ProjectIdSchema,
+  name: z.string().trim().min(1).max(60),
+  /** The GitHub repository this project works in, as `owner/name`. */
+  repository: z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'owner/name'),
+  /** Root under which Ticket worktrees are created; empty uses `<stateDir>/work/<project id>`. */
+  directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work/<project id>').default(''),
+  /** The command that creates a Ticket's checkout, run in the project's parent directory. */
+  prepare: z.string().max(LIMITS.prepareCommand).default(''),
+  /** Worker model for this project; null inherits the Executor's model. */
+  model: RoleModelSchema.nullable().default(null),
+  /** Rule IDs assessed and applied for this project; null or empty uses every enabled rule. */
+  rules: z.array(RuleIdSchema).nullable().default(null),
+  enabled: z.boolean().default(true),
+}).strict()
+export type Project = z.infer<typeof ProjectSchema>
+export const ProjectsValueSchema = z.object({
+  projects: z.array(ProjectSchema).max(50).refine(projects => new Set(projects.map(project => project.id)).size === projects.length, 'Duplicate project IDs').default([]),
+  /** The project whose repository and worktree the Sources watch; null uses the first enabled project. */
+  activeProject: ProjectIdSchema.nullable().default(null),
+}).strict()
+export type ProjectsValue = z.infer<typeof ProjectsValueSchema>
+
 export const AllowedSchema = z.object({ id: z.string().trim().min(1).max(200), name: z.string().trim().max(100).optional() }).strict()
 const Weak = z.enum(['inferred', 'ignore'])
 export const AdmissionRowSchema: z.ZodType<AdmissionRow> = z.object({ listedUnaddressed: Weak.optional(), unlistedAddressed: z.enum(['explicit', 'inferred', 'ignore']).optional(), unlistedUnaddressed: Weak.optional() }).strict()
@@ -87,14 +113,81 @@ export const EvalConfigSchema = z.object({
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
-/** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
+/** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, sandbox and blocked commands. */
+/** Executor kinds: the DSH harness, or a CLI agent run non-interactively in the ticket directory. */
+export const EXECUTOR_KINDS = ['harness', 'claude', 'codex', 'cmd'] as const
+export type ExecutorKind = typeof EXECUTOR_KINDS[number]
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  /**
+   * Sandbox of worker Sessions and CLI agents: `workspace-write` (default) confines writes to the ticket directory and
+   * temporary directories; `danger-full-access` lifts the sandbox and must be chosen explicitly. Escalations are never
+   * approved for unattended workers.
+   */
+  permission: z.enum(['workspace-write', 'danger-full-access']).default('workspace-write'),
+  /** Sandbox of the main (router) Session: `read-only` (default), `workspace-write`, or `danger-full-access`. */
+  routerPermission: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('read-only'),
+  /** What runs a ticket: the DSH harness worker Session, or a CLI agent (`claude`, `codex`, `cmd`) in the ticket directory. */
+  kind: z.enum(EXECUTOR_KINDS).default('harness'),
+  /** Limits of a CLI agent run: wall-clock minutes per run and agent turns (where the CLI supports a turn cap). */
+  cli: z.object({
+    timeoutMinutes: z.number().int().min(1).max(240).default(30),
+    maxTurns: z.number().int().min(1).max(500).default(60),
+  }).strict().default(() => ({ timeoutMinutes: 30, maxTurns: 60 })),
+}).strict().superRefine((value, context) => {
+  // Command Code's print mode blocks file writes and shell commands unless it may bypass permissions; refuse the
+  // combination at save time rather than launch a worker that cannot change anything.
+  if (value.kind === 'cmd' && value.permission !== 'danger-full-access') {
+    context.addIssue({ code: 'custom', path: ['permission'],
+      message: 'Command Code in print mode can only write files and run commands with danger-full-access; choose codex or leave the harness otherwise' })
+  }
+})
+/**
+ * Workflow settings: an independent reviewer Session for a ready ticket with a pull request, a shared round cap for review
+ * and CI fixes, and a watchdog that stops an assignment stuck past `timeoutMinutes`.
+ */
+export const WorkflowConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** Reviewer model; null uses the ticket project's worker model, then the Executor model. */
+  reviewerModel: RoleModelSchema.nullable().default(null),
+  /** Maximum review rounds and CI-fix rounds a ticket may use before it is handed to a person as failed. */
+  maxRounds: z.number().int().min(1).max(10).default(3),
+  watchdog: z.boolean().default(true),
+  /** Minutes after a running assignment's last activity before the watchdog stops it. */
+  timeoutMinutes: z.number().int().min(5).max(1440).default(60),
 }).strict()
+export type WorkflowConfig = z.infer<typeof WorkflowConfigSchema>
+/**
+ * Operational guardrails: proactive alerts to a Ticket's own conversations, and token budgets for a day or one Ticket.
+ * Both are opt-in: alerts are off until enabled, and a budget of 0 is unlimited.
+ */
+export const AlertsConfigSchema = z.object({
+  /** Post alerts into the Ticket's source conversations (a GitHub issue/PR comment or a Feishu reply). */
+  enabled: z.boolean().default(false),
+  /** Alert when a worker reports failed or blocked, or when an Input cannot reach it. */
+  failures: z.boolean().default(true),
+  /** Alert when a worker asks a person a question. */
+  attention: z.boolean().default(true),
+  /** Alert when a token budget is exceeded or processing is paused by one. */
+  budget: z.boolean().default(true),
+}).strict()
+export type AlertsConfig = z.infer<typeof AlertsConfigSchema>
+export const BudgetConfigSchema = z.object({
+  /** All reported tokens (input, output, cache, reasoning) per calendar day; 0 disables the limit. */
+  dailyTokens: z.number().int().min(0).max(2_000_000_000).default(0),
+  /** All reported tokens of one Ticket's worker and reviewer Sessions; 0 disables the limit. */
+  ticketTokens: z.number().int().min(0).max(2_000_000_000).default(0),
+}).strict()
+export type BudgetConfig = z.infer<typeof BudgetConfigSchema>
+export const GuardrailsConfigSchema = z.object({
+  alerts: AlertsConfigSchema.default(() => AlertsConfigSchema.parse({})),
+  budget: BudgetConfigSchema.default(() => BudgetConfigSchema.parse({})),
+}).strict()
+export type GuardrailsConfig = z.infer<typeof GuardrailsConfigSchema>
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
   paused: z.boolean().default(false),
@@ -102,19 +195,64 @@ export const SettingsSchema = z.object({
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
+  workflow: WorkflowConfigSchema.default(() => WorkflowConfigSchema.parse({})),
+  guardrails: GuardrailsConfigSchema.default(() => GuardrailsConfigSchema.parse({})),
+  projects: z.array(ProjectSchema).max(50).refine(projects => new Set(projects.map(project => project.id)).size === projects.length, 'Duplicate project IDs').default([]),
+  /** The project whose repository and worktree the Sources watch; null uses the first enabled project. */
+  activeProject: ProjectIdSchema.nullable().default(null),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
-export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
+export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'workflow' | 'guardrails' | 'projects' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
-export type SettingsOrigin = 'panel' | 'tool' | 'sync'
+export type SettingsOrigin = 'panel' | 'tool' | 'sync' | 'system'
 
 export const POLICY_REVISION = 'mandate-v3'
+/** The active GitHub Source's repository, which a project falls back to while none is configured. */
+const sourceRepository = (settings: Pick<Settings, 'sources'>): string => {
+  const repository = settings.sources.github?.config.repository
+  return typeof repository === 'string' ? repository : ''
+}
+/**
+ * The configured projects; a settings without projects gets one synthetic project from the active GitHub Source and the
+ * Executor's directory, prepare command and model, so a single-repository deployment keeps working unchanged.
+ */
+export function projectsOf(settings: Settings): Project[] {
+  if (settings.projects.length) return settings.projects
+  const repository = sourceRepository(settings)
+  return [{ id: 'default', name: repository || 'Default', repository, directory: settings.executor.directory,
+    prepare: settings.executor.prepare, model: settings.executor.model, rules: null, enabled: true }]
+}
+/** The project Sources watch: `activeProject` when it names an enabled project, else the first enabled project. */
+export function activeProjectOf(settings: Settings): Project {
+  const projects = projectsOf(settings)
+  return projects.find(project => project.id === settings.activeProject && project.enabled)
+    ?? projects.find(project => project.enabled) ?? projects[0]!
+}
+export function projectById(settings: Settings, id: string | null | undefined): Project | undefined {
+  return id ? projectsOf(settings).find(project => project.id === id) : undefined
+}
+/** The project a repository belongs to, else the active project. */
+export function projectFor(settings: Settings, repository?: string): Project {
+  if (repository) {
+    const match = projectsOf(settings).find(project => project.enabled && sameName(project.repository, repository))
+    if (match) return match
+  }
+  return activeProjectOf(settings)
+}
+/** The enabled rules a project assesses and applies; null or empty project rules use every enabled rule. */
+export function rulesForProject(settings: Settings, project?: Project | string | null): Rule[] {
+  const selected = typeof project === 'string' ? projectById(settings, project) : project
+  const ids = selected?.rules
+  return settings.policy.rules.filter(rule => rule.enabled && (!ids?.length || ids.includes(rule.id)))
+}
 /**
  * Compute a version hash for settings that affect work authorization.
  * Changes to models, concurrency, pause state, or polling intervals do not invalidate existing decisions.
  */
 export function policyVersion(settings: Settings): string {
-  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources }))
+  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources,
+    projects: settings.projects.map(project => ({ id: project.id, repository: project.repository, rules: project.rules, enabled: project.enabled })),
+    activeProject: settings.activeProject }))
 }
 export function allowedSender(settings: Settings, actor: ActorRef): z.infer<typeof AllowedSchema> | undefined {
   return settings.policy.sources[actor.source]?.allowed.find(entry => sameName(entry.id, actor.id))

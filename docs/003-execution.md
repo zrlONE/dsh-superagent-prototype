@@ -22,11 +22,60 @@ An `idle` Ticket has finished its turn without an outstanding question. A Trigge
 
 ## The Executor
 
-Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `<stateDir>/work`.
+Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under its project's worktree root; without configured projects, the Executor's execution root defaults to `<stateDir>/work`.
 
-Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
+Executor Sessions run as the operator's OS user. Their sandbox follows the Execution settings: `workspace-write` by default confines file writes to the Ticket directory and permitted temporary directories, and `danger-full-access` lifts it. Approvals are set to `never`, so a request beyond the sandbox is refused rather than asked of nobody. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Its sandbox follows the `routerPermission` setting, `read-only` by default. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+
+### CLI executors
+
+Setting `kind` to `claude`, `codex` or `cmd` replaces the worker Session with that CLI run non-interactively in the Ticket directory. The Executor writes the prompt (`cliPrompt`), starts the CLI, and when it exits normally commits what changed, pushes the Ticket branch through the worker git configuration, and opens or finds the pull request with the agent's GitHub CLI. It binds that pull request to the Ticket before reporting `ready`, so an open pull request leaves the Ticket awaiting review instead of ending it as ready without one. The CLI therefore needs no GitHub credentials of its own.
+
+- `claude` runs with `--permission-mode acceptEdits`, its file tools rooted at the Ticket directory, and only the shell commands in `CLAUDE_ALLOWED_TOOLS`, unless `permission` is `danger-full-access`, which uses `bypassPermissions`.
+- `codex` runs under its own `workspace-write` sandbox unless `permission` is `danger-full-access`, which uses `--dangerously-bypass-approvals-and-sandbox`. Codex has no turn cap; only the wall-clock limit applies.
+- `cmd` is Command Code. Its print mode blocks file writes and shell commands without `--yolo`, so settings accept it only with `danger-full-access`.
+
+`cli.timeoutMinutes` caps each run and `cli.maxTurns` caps agent turns where the CLI has a turn flag. A run holds a worker slot, and ending the Ticket aborts it. A follow-up resumes the CLI's own session when the CLI reported one. CLI runs have no harness Session, background jobs or subagents, so the background-work rules above do not apply to them.
+
+### Projects
+
+Execution settings hold projects. A project names one GitHub repository, a worktree root (`directory`, or `<stateDir>/work/<project id>` when empty), a prepare command, a worker model and the Policy rules its work is assessed and executed under. An empty rule selection uses every enabled rule.
+
+A Ticket belongs to the project whose repository its origin Trigger names. When an accept creates the Ticket, the Executor fixes its directory under that project's worktree root and uses the project's prepare command for its first checkout; its worker Session uses the project's model, falling back to the Executor model. The ticket's execution environment names the project's repository, so `$DSH_SUPERAGENT_GITHUB_REPOSITORY` and the agent's `gh` calls address the right repository. A later project change does not move an accepted Ticket: its directory and model stay as fixed at accept time.
+
+Without projects, one synthetic project is derived from the active GitHub Source and the Executor's directory, prepare command and model, so a single-repository deployment behaves as before.
+
+The active project decides the repository the GitHub Source watches: its notifications and repository-wide streams (Issues, PRs, comments, default-branch CI) belong to that repository. Saving a different active project rechecks the agent's access and restarts dsh-superagent. Existing Tickets in another project keep their Subscriptions; this step does not yet poll every configured repository at once.
+
+### Workflow: review, CI rounds and watchdog
+
+Workflow is off by default. When enabled, a `ready` Report with an open pull request starts an independent reviewer Session named `reviewer-<ticket id>` in the same Ticket directory, with the worker's tools under a `read-only` sandbox. The reviewer inspects the checkout and the pull request, runs the tests, and ends by calling `workflow_review` with `approve` or `changes`, a summary and concrete issues.
+
+- `approve` relays the verdict to the main Session and leaves the Ticket awaiting a person; it does not merge.
+- `changes` sends the issues to the writer as a note Input, which wakes it to fix them and report ready again. The review round advances.
+- When the round reaches `workflow.maxRounds`, the Ticket is reported `failed`, its assignment is stopped, and a person must decide.
+
+CI failures delivered to a Ticket count as automatic fix rounds against the same `maxRounds`; once exceeded, the Workflow reports the Ticket failed and stops the assignment. Passing CI does not consume a round.
+
+The watchdog stops an assignment in `working` whose last activity (assignment start, latest delivery, turn end, Report or Input) is older than `workflow.timeoutMinutes`, reports the Ticket failed, and tells the main Session. A ready Ticket waiting for review is not "stuck" and is left alone.
+
+The reviewer uses `workflow.reviewerModel`, falling back to the Ticket project's model and then the Executor model. Reviewer Sessions keep the worker preset but cannot write to the checkout. Their verdict tool is `workflow_review`; the reviewer also has `orchestrator_read` for the Ticket's resources.
+
+### Guardrails: alerts and token budgets
+
+Guardrails run after every pass. They are off by default and are configured in **Settings → Execution → Alerts and budget**.
+
+With alerts enabled, a Ticket's source conversations receive one notice when:
+
+- its latest Report is `failed` or `blocked`;
+- an Input could not reach its worker;
+- its worker asks a person a question (`attention`);
+- a token budget is exceeded.
+
+Each alert is recorded per Ticket, so a repeated pass does not post it again; a new question or Report starts a new alert. The message goes to the GitHub issue/PR or Feishu thread where the request was written, using the same idempotent outbox as ordinary replies. `failures`, `attention` and `budget` can be switched independently.
+
+A token budget of `0` is unlimited. `guardrails.budget.ticketTokens` counts the Ticket's worker and reviewer Sessions; when reached, the Ticket is reported `failed`, its assignment is stopped, and a person decides the remaining work. `guardrails.budget.dailyTokens` counts every reported token for the calendar day; when exceeded, processing is paused and an alert goes to the most recently updated open Ticket. Raising the daily budget or waiting for the next day lets processing resume.
 
 ### Background work and worker slots
 
@@ -50,7 +99,17 @@ Worker subagents, including nested ones, use DeepSeek Harness's `standard` prese
 
 Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. It has ten minutes to finish. Without a prepare command, the worker starts in an empty directory.
 
-A failed command fails the Ticket and records its output. A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command uses `git worktree` to create a checkout. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
+A failed command fails the Ticket and records its output. A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command creates a self-contained checkout under the Ticket directory. With the default `workspace-write` sandbox, use `git clone --shared` rather than `git worktree`: a linked worktree's `.git` metadata lives in the source clone, outside the worker's writable workspace, so the worker can edit and test but cannot commit or push. With `danger-full-access`, `git worktree add` is cheaper and works.
+
+```sh
+git clone --shared /path/to/clone "$DSH_SUPERAGENT_DIR" &&
+  cd "$DSH_SUPERAGENT_DIR" &&
+  git remote set-url origin "https://github.com/$DSH_SUPERAGENT_GITHUB_REPOSITORY.git" &&
+  git fetch --no-tags origin "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-HEAD}" &&
+  git checkout -b "agent/$DSH_SUPERAGENT_NAME" FETCH_HEAD
+```
+
+A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
 
 ### Concurrency
 

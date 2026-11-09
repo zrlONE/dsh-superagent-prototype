@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <title>dsh-superagent · Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">◆</span>
+      <div>
+        <h1>dsh-superagent</h1>
+        <p class="muted">跨项目看板 · cross-project board</p>
+      </div>
+    </div>
+    <div class="top-right">
+      <span id="health" class="pill" data-tone="idle">连接中</span>
+      <button id="pause" class="button" type="button" disabled>暂停</button>
+      <button id="refresh" class="button" type="button">刷新</button>
+    </div>
+  </header>
+
+  <main>
+    <p id="error" class="error" role="status" hidden></p>
+    <section id="summary" class="cards" aria-label="概览"></section>
+
+    <section class="block">
+      <div class="block-head"><h2>项目</h2><span id="updated" class="muted"></span></div>
+      <div id="projects" class="cards wide"></div>
+    </section>
+
+    <section class="block">
+      <div class="block-head"><h2>工单</h2><span class="muted">打开与最近结束</span></div>
+      <div id="tickets" class="tickets"></div>
+    </section>
+
+    <div class="split">
+      <section class="block">
+        <div class="block-head"><h2>Agent</h2><span class="muted">worker · reviewer · orchestrator</span></div>
+        <div id="agents" class="list"></div>
+      </section>
+      <section class="block">
+        <div class="block-head"><h2>用量</h2><span class="muted">tokens · cost</span></div>
+        <div id="usage"></div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="muted">自动刷新；手机访问请用带 token 的地址。</footer>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

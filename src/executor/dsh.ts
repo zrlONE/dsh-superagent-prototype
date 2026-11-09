@@ -9,7 +9,8 @@ import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Execu
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
-import type { Settings } from '../policy.ts'
+import type { Project, Settings } from '../policy.ts'
+import { projectFor, rulesForProject } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
@@ -17,6 +18,8 @@ import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import type { UsageMeter } from '../app/usage.ts'
+import { cliArgv, cliPrompt, parseCliOutput, pullNumber, pullTitle, type CliKind, type CliResult } from './cli.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
 const now = (): string => new Date().toISOString()
@@ -61,10 +64,12 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'bindThread'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
+  /** Token usage accounting for CLI runs, whose usage the CLI reports itself. */
+  readonly usage?: Pick<UsageMeter, 'add'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
@@ -79,6 +84,8 @@ export interface ExecutorHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
+  /** The configured deployment (repository and the agent's GitHub CLI and identity), which a CLI executor's hand-off uses. */
+  deployment?(): { repository: string; github: { cli: string; login: string; noreply: string } } | undefined
 }
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
@@ -93,9 +100,9 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
     + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
     + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
 }
-/** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
+/** Builds a newly accepted ticket's Execution metadata in `project`'s worktree root: its worktree name, directory and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
-  stateDir: string): Execution {
+  stateDir: string, project?: Project): Execution {
   const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
   const note = outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : ''
@@ -107,7 +114,7 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const assignment = ticket.mandate.strength === 'inferred' && ruleIds
     ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
     : note.trim()
-  return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
+  return { name, directory: join(executionRoot(settings, stateDir, project), name), assignment }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
 const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600
@@ -224,6 +231,10 @@ export class DshExecutor implements Executor {
   private readonly personal = new Map<string, string>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
+  /** Running CLI agent runs by ticket, which `stop` aborts and which hold their worker slot. */
+  private readonly cli = new Map<string, AbortController>()
+  /** The CLI's own session id per ticket, so a follow-up continues the same conversation. */
+  private readonly cliSessions = new Map<string, string>()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
   constructor(private readonly host: ExecutorHost) {
     this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
@@ -236,18 +247,25 @@ export class DshExecutor implements Executor {
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
+    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir, this.projectOf(ticket)) }
+  }
+  /** The project of a ticket's origin repository, else the active project. */
+  private projectOf(ticket: Ticket): Project {
+    const trigger = sourceTrigger(this.host, ticket)
+    return projectFor(this.host.store.settings(), typeof trigger?.meta.repository === 'string' ? trigger.meta.repository : undefined)
   }
   /**
-   * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
-   * execution environment variables, then verifies the directory as the worker sees it.
+   * Runs the project's `prepare` command for a new ticket workspace in its parent directory with the ticket's execution
+   * environment variables, then verifies the directory as the worker sees it. A settings without projects uses the
+   * Executor's single prepare command.
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
     const directory = ticket.execution?.directory ?? ''
     await mkdir(dirname(directory), { recursive: true })
-    const command = this.host.store.settings().executor.prepare.trim()
+    const settings = this.host.store.settings()
+    const command = (settings.projects.length ? this.projectOf(ticket).prepare : settings.executor.prepare).trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
@@ -293,6 +311,26 @@ export class DshExecutor implements Executor {
     const first = this.host.store.tickets.get(ticketId)
     const target = first && liveTicket(first) ? runningAssignment(first) : undefined
     if (!first || !target || !first.undelivered.length) return
+    const kind = this.host.store.settings().executor.kind
+    if (kind !== 'harness') {
+      // A CLI run takes the waiting Inputs together as one follow-up once the run before it ended.
+      if (this.cli.has(ticketId)) throw new Later('The CLI agent is still running')
+      const ids = [...first.undelivered], texts: string[] = []
+      for (const id of ids) {
+        const input = first.inputs.find(item => item.id === id)
+        const trigger = input?.kind === 'trigger' ? await this.triggerCard(first, input.triggerId, input.note) : undefined
+        const message = input && inputMessage(input, trigger)
+        if (message) texts.push(message)
+      }
+      // Waking an idle CLI worker takes a slot like a harness worker; a person's message may use the extra slot.
+      const waking = !this.running(first)
+      if (waking) this.slots.reserve(ticketId, ids.some(id => fromPerson(first.inputs.find(item => item.id === id))) ? 'person' : 'wake')
+      try {
+        this.host.engine.inputsDelivered(ticketId, target.id, ids)
+        if (texts.length) this.runCli(first, target, kind, { followup: texts.join('\n\n') }, ids)
+      } finally { if (waking) this.slots.free(ticketId) }
+      return
+    }
     let woken = false
     try {
       for (;;) {
@@ -361,6 +399,7 @@ export class DshExecutor implements Executor {
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
+      this.cli.get(ticket.id)?.abort(reason)
       this.settling.get(ticket.id)?.abort()
       if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
@@ -393,6 +432,7 @@ export class DshExecutor implements Executor {
       .filter((agent): agent is Agent => agent !== undefined)
     const stop = async () => {
       await Promise.allSettled(agents.map(agent => stopBackground(this.host.context, agent.id, 'dsh-superagent stopped', true)))
+      for (const controller of this.cli.values()) controller.abort('dsh-superagent stopped')
       for (const { collect } of this.left.values()) collect.abort()
       const running = agents.filter(agent => agent.status !== 'idle')
       for (const agent of running) agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -405,7 +445,7 @@ export class DshExecutor implements Executor {
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false
-    return this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
+    return this.cli.has(ticket.id) || this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
   }
   /** Marks a ticket failed after its launch fails; the ticket waits until new human input or an explicit retry arrives. */
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
@@ -419,6 +459,93 @@ export class DshExecutor implements Executor {
       const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
       this.relay(resultRelay(updated, 'failed', summary))
     })
+  }
+  /**
+   * Runs a CLI agent for `ticket` in its directory in the background, holding its worker slot, then hands off: commits
+   * what changed, pushes the ticket branch with the worker git configuration and opens a pull request with the agent's
+   * GitHub CLI, and reports `ready` (or `failed`) to the ticket and the main Session. `inputs` are the waiting Inputs whose
+   * text this run took, marked read when it ends either way.
+   */
+  private runCli(ticket: Ticket, assignment: Assignment, kind: CliKind, task: { request?: string; followup?: string }, inputs?: string[]): void {
+    const controller = new AbortController()
+    this.cli.set(ticket.id, controller)
+    const settings = this.host.store.settings().executor
+    const limits = settings.cli, permission = settings.permission
+    const directory = ticket.execution?.directory ?? ''
+    const deployment = this.host.deployment?.()
+    // The ticket's project names the repository the pull request belongs to; the deployment is the fallback.
+    const repository = this.projectOf(ticket).repository || deployment?.repository
+    const deployed = deployment && repository ? { ...deployment, repository } : deployment
+    const prompt = cliPrompt({ title: ticket.title, request: task.request ?? '', assignment: ticket.execution?.assignment,
+      repository: deployed?.repository, followup: task.followup })
+    const signal = AbortSignal.any([this.host.lifetime, controller.signal, AbortSignal.timeout(limits.timeoutMinutes * 60_000)])
+    const live = () => {
+      const stored = this.host.store.tickets.get(ticket.id)
+      return !!stored && liveTicket(stored) && runningAssignment(stored)?.id === assignment.id
+    }
+    void this.background((async () => {
+      let summary: string, state: 'ready' | 'failed'
+      try {
+        // The argv is built here so a combination the CLI cannot run (Command Code without full access) is reported on
+        // the ticket instead of escaping into the effect that launched it.
+        const argv = cliArgv(kind, prompt, directory, limits, permission, task.followup ? this.cliSessions.get(ticket.id) : undefined)
+        const env = { ...Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value])),
+          CI: '1', NO_COLOR: '1', TERM: 'dumb' }
+        const handle = this.host.context.subprocess.spawn({ argv: ['nice', '-n', '10', ...argv], cwd: directory, graceMs: 5000, signal, env,
+          stdio: { stdin: 'ignore', stdout: { maxBytes: 16 << 20 }, stderr: { maxBytes: 1 << 16 } } })
+        const { exitCode } = await handle.done
+        const result: CliResult = parseCliOutput(kind, handle.collected.stdout?.readFrom(0).text ?? '', exitCode)
+        if (result.session) this.cliSessions.set(ticket.id, result.session)
+        // A CLI reports its own token usage; count it under the ticket's worker Session for the dashboard.
+        if (result.usage) this.host.usage?.add(workerSessionId(ticket.id), 'cli', result.model ?? kind,
+          { ...result.usage, reasoning: 0, calls: 1 })
+        const stderr = (handle.collected.stderr?.readFrom(0).text ?? '').trim().slice(-2000)
+        if (!result.ok && stderr && !result.text.includes(stderr)) result.text = `${result.text}\n${stderr}`.trim()
+        if (signal.aborted) throw new Error(controller.signal.aborted ? `Stopped: ${String(controller.signal.reason)}` : `${kind} ran past ${limits.timeoutMinutes} minutes`)
+        if (!result.ok) throw new Error(`${kind} failed: ${result.text.slice(0, 2000)}`)
+        if (!live()) throw new Error('The ticket ended or another Assignment took it over before the hand-off')
+        const handoff = await this.handOffCli(ticket, deployed, result, controller.signal)
+        // The ticket opened this pull request itself: bind it now, before the ready report, so an open PR keeps the ticket
+        // awaiting review instead of ending it as "ready without a pull request" until a Source poll finds the PR.
+        if (handoff.pull !== undefined) this.host.engine.bindThread(ticket.id, { source: 'github', id: String(handoff.pull) }, true)
+        state = 'ready'
+        summary = [result.text.trim().slice(0, 3000), handoff.line].filter(Boolean).join('\n\n')
+      } catch (error) {
+        state = 'failed'
+        summary = error instanceof Error ? error.message : String(error)
+      } finally { if (this.cli.get(ticket.id) === controller) this.cli.delete(ticket.id) }
+      if (!live() || this.host.closing()) return
+      this.host.store.atomic(() => {
+        this.host.engine.turnEnded(ticket.id, assignment.id)
+        if (inputs?.length) this.host.engine.inputsRead(ticket.id, inputs)
+        const updated = this.host.engine.report(ticket.id, { state, summary })
+        this.relay(resultRelay(updated, state, summary))
+      })
+    })())
+  }
+  /** Commits, pushes and opens (or finds) the pull request of a finished CLI run; returns a line naming it and its number. */
+  private async handOffCli(ticket: Ticket, deployment: ReturnType<NonNullable<ExecutorHost['deployment']>>, result: CliResult,
+    stop?: AbortSignal): Promise<{ line: string; pull?: number }> {
+    const directory = ticket.execution?.directory ?? ''
+    const signal = () => AbortSignal.any([this.host.lifetime, ...stop ? [stop] : [], AbortSignal.timeout(120_000)])
+    const git = (...args: string[]) => runAsWorker(this.host.context.subprocess, ['git', ...args], directory, signal())
+    if ((await git('status', '--porcelain')).trim()) {
+      await git('add', '-A')
+      const identity = deployment ? ['-c', `user.name=${deployment.github.login}`, '-c', `user.email=${deployment.github.noreply}`] : []
+      await git(...identity, 'commit', '-q', '-m', pullTitle(ticket.title), '-m', `Ticket ${ticket.id}`)
+    }
+    const branch = (await git('rev-parse', '--abbrev-ref', 'HEAD')).trim()
+    const ahead = (await git('rev-list', '--count', `${branch}`, '--not', '--remotes')).trim()
+    if (ahead === '0') return { line: 'No changes to push.' }
+    if (!deployment) return { line: `Committed on ${branch}; no deployment configured to push.` }
+    await git('push', '-q', '-u', 'origin', `HEAD:refs/heads/${branch}`)
+    const gh = (...args: string[]) => runAsWorker(this.host.context.subprocess, [deployment.github.cli, ...args], directory, signal())
+    const existing = (await gh('pr', 'list', '--repo', deployment.repository, '--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url')
+      .catch(() => '')).trim()
+    if (existing) return { line: `Pushed ${branch}; pull request: ${existing}`, pull: pullNumber(existing) }
+    const body = `${result.text.trim().slice(0, 4000)}\n\n---\nTicket ${ticket.id}`
+    const url = (await gh('pr', 'create', '--repo', deployment.repository, '--head', branch, '--title', pullTitle(ticket.title), '--body', body)).trim()
+    return { line: `Pushed ${branch}; opened pull request: ${url.split('\n').at(-1) ?? url}`, pull: pullNumber(url) }
   }
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
@@ -437,8 +564,18 @@ export class DshExecutor implements Executor {
       if (!current()) return
     }
     if (!current()) return
+    const kind = this.host.store.settings().executor.kind
+    if (kind !== 'harness') {
+      const card = source ? await this.triggerCard(ticket, source.id) : undefined
+      if (!current()) return
+      this.host.engine.assignmentStarted(ticket.id, assignment.id)
+      this.runCli(ticket, assignment, kind, { request: JSON.stringify(card ?? { text: source?.text ?? '' }) })
+      return
+    }
     const sessionId = workerSessionId(ticket.id)
-    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+    const settings = this.host.store.settings()
+    const model = this.projectOf(ticket).model ?? settings.executor.model
+    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker', model)
     if (!current()) return
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)

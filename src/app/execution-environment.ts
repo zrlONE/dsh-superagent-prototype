@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import type { Ticket, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Settings } from '../policy.ts'
+import type { Project } from '../policy.ts'
 import type { Localized, VariableSpec } from '../sources/kind.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 
@@ -15,7 +16,14 @@ export const EXECUTOR_VARIABLES: readonly (VariableSpec & { ticket?: true })[] =
 ]
 export interface Variable { key: string; value: string; description: Localized; owner: string }
 
-export const executionRoot = (settings: Settings, stateDir: string): string => settings.executor.directory || join(stateDir, 'work')
+/**
+ * The root under which Ticket worktrees are created: a project's own directory, or `<stateDir>/work/<project id>`; a
+ * settings without projects keeps the Executor's single root.
+ */
+export const executionRoot = (settings: Settings, stateDir: string, project?: Project): string => {
+  if (!project || !settings.projects.length) return settings.executor.directory || join(stateDir, 'work')
+  return project.directory || join(stateDir, 'work', project.id)
+}
 
 /** Lists all declared variables grouped by owner; `enabled` is false for Sources that are currently switched off. */
 export function declaredVariables(sources: SourceRegistry, settings?: Settings): { owner: string; enabled: boolean; variables: readonly VariableSpec[] }[] {

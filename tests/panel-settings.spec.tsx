@@ -52,10 +52,14 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await type(workerProvider as HTMLInputElement, 'worker-provider'); await type(workerModel as HTMLInputElement,
     'worker-model'); await type(effort as HTMLInputElement, 'high')
   expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
+  await type(field<HTMLSelectElement>(zh.executorKind), 'cmd')
+  await type(field<HTMLSelectElement>(zh.workerPermission), 'danger-full-access')
+  await type(field<HTMLSelectElement>(zh.routerPermission), 'workspace-write')
   await click(zh.save)
   expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work',
     prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'], model: { provider: 'worker-provider',
-      model: 'worker-model', reasoningEffort: 'high' } })
+      model: 'worker-model', reasoningEffort: 'high' }, permission: 'danger-full-access', routerPermission: 'workspace-write', kind: 'cmd',
+    cli: { timeoutMinutes: 30, maxTurns: 60 } })
   expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval',
     'settings/executor'])
 })
@@ -144,4 +148,47 @@ it('lists the settings groups stages first, opens each stage\'s group from its s
   await remount()
   await click(tab(zh['tab.settings']))
   expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
+})
+
+it('adds a project with its repository, worktree root, prepare command and active switch', async () => {
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await click(zh.projectAdd)
+  await type(field<HTMLInputElement>(zh.projectName), 'Alpha')
+  await type(field<HTMLInputElement>(zh.projectId), 'alpha')
+  await type(field<HTMLInputElement>(zh.projectRepository), 'acme/alpha')
+  await type(field<HTMLInputElement>(zh.projectDirectory), '/srv/alpha')
+  await type(field<HTMLTextAreaElement>(zh.projectPrepare), 'make alpha')
+  await click(zh.save)
+  expect(server.settings.projects).toEqual([{ id: 'alpha', name: 'Alpha', repository: 'acme/alpha', directory: '/srv/alpha',
+    prepare: 'make alpha', model: null, rules: null, enabled: true }])
+  expect(server.settings.activeProject).toBe('alpha')
+  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toContain('settings/projects')
+})
+
+it('enables the workflow and saves its round and watchdog settings', async () => {
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await click(zh.workflowEnabled)
+  await type(field<HTMLInputElement>(zh.workflowMaxRounds), '5')
+  await click(zh.workflowWatchdog)
+  await type(field<HTMLInputElement>(zh.workflowTimeout), '90')
+  await click(zh.save)
+  expect(server.settings.workflow).toEqual({ enabled: true, reviewerModel: null, maxRounds: 5, watchdog: false, timeoutMinutes: 90 })
+  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toContain('settings/workflow')
+})
+
+it('enables proactive alerts and saves daily and Ticket token budgets', async () => {
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await click(zh.alertsEnabled)
+  await type(field<HTMLInputElement>(zh.budgetDailyTokens), '1000000')
+  await type(field<HTMLInputElement>(zh.budgetTicketTokens), '200000')
+  await click(zh.save)
+  expect(server.settings.guardrails).toEqual({ alerts: { enabled: true, failures: true, attention: true, budget: true },
+    budget: { dailyTokens: 1000000, ticketTokens: 200000 } })
+  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toContain('settings/guardrails')
 })

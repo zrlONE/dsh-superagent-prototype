@@ -2,6 +2,7 @@
 import { liveTicket, threadKey, ticketStage, type AcceptMode, type AdmissionCell, type MandateBasis, type Ticket,
   type TicketStage } from '../../core/index.ts'
 import { workerSessionId } from '../../executor/dsh.ts'
+import { KV } from '../../kv.ts'
 import type { Store } from '../store.ts'
 import { channelLink, decisionView, newestFirst, page, snapshot, threadSummary, ticketLine, type Snapshot,
   type ViewHost } from './records.ts'
@@ -80,6 +81,7 @@ export function ticketDetail(host: ViewHost, id: string) {
       ...assignment.state === 'running' && assignment.report && assignment.report.state !== 'progress' && stage !== 'working'
         ? { turnEndedAt: assignment.report.at } : {} })),
     inputs: ticket.inputs.slice().reverse().map(input),
+    workflow: store.get(KV.workflow.state(id)),
     // Threads followed for context only (e.g., related issues) grant no authority and are marked with `context: true`.
     threads: view.threadsOf(id).map(thread => ({ ...threadSummary(view, thread),
       ...thread.context?.includes(id) ? { context: true as const } : {} })) }

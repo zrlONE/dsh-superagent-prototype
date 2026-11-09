@@ -22,6 +22,8 @@
   "files": [
     "lib",
     "cordis.patch.yml",
+    "dashboard",
+    "scripts/dsh-superagent-dashboard.mjs",
     "locale/*.json",
     "README.md",
     "prompts",
@@ -48,6 +50,7 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "dashboard": "node scripts/dsh-superagent-dashboard.mjs",
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },
   "engines": {

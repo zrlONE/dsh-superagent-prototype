@@ -4,7 +4,7 @@ import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
-import { SettingsSchema } from '../src/policy.ts'
+import { SettingsSchema, projectsOf } from '../src/policy.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
@@ -940,4 +940,19 @@ describe('the Executor\'s parts', () => {
     expect(ready.id).toMatch(/^report:/)
     expect(JSON.parse(ready.text)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: 't1' }, trigger_id: 'tr1', state: 'ready', answer_to: 'tr9', summary: 'Done' })
   })
+})
+
+it('places a ticket under its project worktree root, or stateDir/work/<project> when the project names none', () => {
+  const settings = SettingsSchema.parse({ projects: [
+    { id: 'alpha', name: 'Alpha', repository: 'acme/alpha', directory: '/srv/alpha', prepare: 'make alpha' },
+    { id: 'beta', name: 'Beta', repository: 'acme/beta' },
+  ], activeProject: 'alpha' })
+  const ticket = { id: 'ticket-0123456789abcdef', origin: { triggerId: 'tr1', triggerIds: [] },
+    mandate: { strength: 'inferred', policyVersion: 'v1', basis: { rules: ['copy'] }, actor: { source: 'github', id: 'alice' }, scope: '' } } as unknown as Ticket
+  const outcome = { kind: 'accept', title: 'Fix', scope: 'the typo', reason: 'r', name: 'fix-typo' } as never
+  const [alpha, beta] = projectsOf(settings)
+  expect(ticketExecution(ticket, outcome, settings, '/state', alpha).directory).toBe('/srv/alpha/fix-typo-ticket-01234')
+  expect(ticketExecution(ticket, outcome, settings, '/state', beta).directory).toBe('/state/work/beta/fix-typo-ticket-01234')
+  // Without projects, the Executor's single root is unchanged for existing tickets.
+  expect(ticketExecution(ticket, outcome, SettingsSchema.parse({}), '/state').directory).toBe('/state/work/fix-typo-ticket-01234')
 })

@@ -13,6 +13,8 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /** The project a Trigger's repository belongs to, for project-scoped rules and execution. */
+  projectId?: (trigger: Trigger) => string | undefined
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

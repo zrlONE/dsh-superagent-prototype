@@ -10,6 +10,8 @@ export interface PassesHost {
   readonly lifetime: AbortSignal
   configured(): boolean
   closing(): boolean
+  /** Extra work after a pass, such as the Workflow's review and watchdog checks; it must not throw. */
+  afterPass?(): void | Promise<void>
 }
 
 const now = (): string => new Date().toISOString()
@@ -65,5 +67,7 @@ export class Passes {
     if (this.host.closing()) return
     // While processing is paused, the Engine only records the pause on active Evals so they do not expire.
     this.host.engine.evaluateDue()
+    // The Workflow has its own error handling and must not hold back the pass loop.
+    void this.host.afterPass?.()
   }
 }

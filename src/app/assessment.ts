@@ -3,7 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { reasonText, threadKey, type Assessor, type AssessmentOutcome, type Candidate, type EngineForMainSession,
   type Trigger } from '../core/index.ts'
-import { AdmissionDirectionSchema, RuleAssessmentSchema, assessmentOutcome, directionAllowed, type Settings } from '../policy.ts'
+import { AdmissionDirectionSchema, RuleAssessmentSchema, assessmentOutcome, directionAllowed, projectFor, rulesForProject, type Settings } from '../policy.ts'
 import { checkedImText } from '../infra/text.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
@@ -22,7 +22,7 @@ export const AssessmentSchema = z.object({
   decision: z.enum(['accept', 'ignore', 'unavailable']),
   rule_assessments: z.array(RuleAssessmentSchema)
     .refine(assessments => new Set(assessments.map(assessment => assessment.rule_id)).size === assessments.length,
-      'Duplicate rule assessment IDs').describe('One per enabled rule.'),
+      'Duplicate rule assessment IDs').describe('One per rule in the candidate\'s rules.'),
   direction: AdmissionDirectionSchema.describe('Required for every decision.'),
   title: z.string().min(1).max(160),
   worktree_name: WorktreeNameSchema.optional(),
@@ -205,8 +205,12 @@ export class MasterAssessor implements Assessor {
         ...context.next ? { next_cursor: context.next } : {}, messages }
     })() : { error: error ?? 'Call orchestrator_eval to load initial context', complete: false }
     const settings = this.host.settings()
+    const project = projectFor(settings, candidate.projectId)
+    const rules = rulesForProject(settings, project)
     const others = candidate.triggers.filter(item => item.id !== trigger.id)
     return { trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
+      project: { id: project.id, name: project.name, repository: project.repository },
+      rules: rules.map(rule => rule.id),
       source: { kind: trigger.source, actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), ...(trigger.url
         ? { url: trigger.url } : {}) },
       ...cut(trigger.text, TRIGGER_CHARS), ...imageIds(source?.messageId ?? '', trigger.text),
@@ -214,7 +218,7 @@ export class MasterAssessor implements Assessor {
         const text = cut(item.text, WINDOW_CHARS)
         return { trigger_id: item.id, actor: item.actor.id, at: item.at, ...text, ...'chars' in text ? { read: `trigger/${item.id}` } : {} }
       }) } : {},
-      // The rules are in the main Session's Policy section, which names the version the candidate's Eval was built from.
+      // The rules are in the main Session's Policy section and narrowed to this candidate's project in `rules`.
       ...relatedTickets(candidate.tickets), policy_version: candidate.policyVersion,
       thread }
   }
@@ -272,7 +276,9 @@ export class MasterAssessor implements Assessor {
   async decide(triggerId: string, result: z.infer<typeof AssessmentSchema>, signal?: AbortSignal): Promise<{ state: string; ticket_id?: string; reason: string }> {
     const { candidate } = this.evalFor(triggerId)
     signal?.throwIfAborted()
-    let outcome: AssessmentOutcome = assessmentOutcome(result, this.host.settings(), candidate.strength)
+    const settings = this.host.settings()
+    // A project's rules, rather than every enabled rule, decide what its candidates are assessed against.
+    let outcome: AssessmentOutcome = assessmentOutcome(result, settings, candidate.strength, rulesForProject(settings, candidate.projectId))
     if (outcome.kind === 'accept' && outcome.acknowledgement) outcome = { ...outcome, acknowledgement: checkedImText(outcome.acknowledgement) }
     const decision = this.host.engine.decide(triggerId, { ...outcome, evalId: candidate.evalId })
     return { state: decision.kind, ...(decision.ticketId ? { ticket_id: decision.ticketId } : {}), reason: reasonText(decision.reason) }

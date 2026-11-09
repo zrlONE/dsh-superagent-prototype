@@ -33,6 +33,8 @@ export interface Candidate {
   triggers: Trigger[]
   strength: Strength
   policyVersion: string
+  /** The project the primary Trigger's repository belongs to, when the deployment configures projects. */
+  projectId?: string
   /** Every ticket on the thread, including ended ones, for duplicate judgement. */
   tickets: Ticket[]
 }
